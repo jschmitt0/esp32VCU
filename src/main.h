@@ -13,5 +13,3 @@
 
 // extern USBCDC USBSerial1; // First virtual serial port
 // //extern USBCDC USBSerial2; // Second virtual serial port
-
-#define RGB_BUILTIN    48   // Built-in LED pin on ESP32-S3
