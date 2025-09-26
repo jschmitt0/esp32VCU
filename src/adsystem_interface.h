@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <vector>
 #include <functional>
+#include <WString.h>
 
 // UART handler for AD System Interface
 
@@ -74,3 +75,5 @@ private:
 extern AdsysUartHandler adsysHandler;
 
 void sendDebugMessage(const char* msg);
+void sendDebugMessage(const String& msg);
+void sendDebugMessage(StringSumHelper& msg);

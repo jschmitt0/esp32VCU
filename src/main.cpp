@@ -11,6 +11,10 @@
 #include "adsystem_interface.h"
 #include "vehicle_control.h"
 
+#define GVRET_PORT Serial
+#define MONITOR_PORT USBSerial1
+#define ADSYS_PORT USBSerial1 // same as MONITOR_PORT
+
 // USB Serial Setup: Use a clear name for the USB CDC object.
 USBCDC USBSerial1(0); // First virtual serial port
 //USBCDC USBSerial2(0); // Second virtual serial port
@@ -777,6 +781,15 @@ void AdsysUartHandler::uartSendBytes(std::vector<uint8_t> &bytes)
 }
 
 void sendDebugMessage(const char* msg)
+{
+    MONITOR_PORT.println(msg);
+}
+
+void sendDebugMessage(const String& msg)
+{
+    MONITOR_PORT.println(msg);
+}
+void sendDebugMessage(StringSumHelper& msg)
 {
     MONITOR_PORT.println(msg);
 }

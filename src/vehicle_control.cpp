@@ -6,8 +6,7 @@
 
 #define LOG_VEHICLE_CONTROL 1
 #if (LOG_VEHICLE_CONTROL==1)
-    #define VC_LOG_PORT MONITOR_PORT
-    #define LOG_MSG(x) VC_LOG_PORT.println(x)
+    #define LOG_MSG(x) sendDebugMessage(x)
 #else
     #define LOG_MSG(x)
 #endif
