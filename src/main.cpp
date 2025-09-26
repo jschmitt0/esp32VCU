@@ -5,7 +5,6 @@
 #include "USB.h"
 #include "USBCDC.h"
 #include <TaskScheduler.h>
-#include <ESP32Servo.h>
 
 #include "main.h"
 #include "adsystem_interface.h"
@@ -27,7 +26,7 @@ USBCDC USBSerial1(0); // First virtual serial port
 // #define RGB_BUILTIN    48   // Built-in LED pin on ESP32-S3
 // #define RGB_BRIGHTNESS 0    // 0 for OFF
 
-Servo brake_servo;
+//Servo brake_servo;
 const int servoPin = 17;
 int pos = 0;
 
@@ -744,12 +743,12 @@ void setup()
     USB.begin();
 
     // Initialize Servo
-    ESP32PWM::allocateTimer(0);
-    ESP32PWM::allocateTimer(1);
-    ESP32PWM::allocateTimer(2);
-    ESP32PWM::allocateTimer(3);
-    brake_servo.setPeriodHertz(50);           // standard 50 hz servo
-    brake_servo.attach(servoPin, 1000, 2000); // attaches the servo on pin 18 to the servo object
+    //ESP32PWM::allocateTimer(0);
+    //ESP32PWM::allocateTimer(1);
+    //ESP32PWM::allocateTimer(2);
+    //ESP32PWM::allocateTimer(3);
+    //brake_servo.setPeriodHertz(50);           // standard 50 hz servo
+    //brake_servo.attach(servoPin, 1000, 2000); // attaches the servo on pin 18 to the servo object
 
     // Configure the built-in RGB LED.
     pinMode(RGB_BUILTIN, OUTPUT);
