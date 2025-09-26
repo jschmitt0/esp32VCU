@@ -7,18 +7,14 @@
 #include <TaskScheduler.h>
 #include <ESP32Servo.h>
 
+#include "main.h"
 #include "adsystem_interface.h"
-#include "system_state_control.h"
-
-// Define GVRET_PORT and MONITOR_PORT.
-// GVRET communication uses the primary Serial port.
-// Monitoring/debug output uses USBSerial1.
-#define GVRET_PORT Serial
-#define MONITOR_PORT USBSerial1
-#define ADSYS_PORT USBSerial1 // same as MONITOR_PORT
+#include "vehicle_control.h"
 
 // USB Serial Setup: Use a clear name for the USB CDC object.
 USBCDC USBSerial1(0); // First virtual serial port
+//USBCDC USBSerial2(0); // Second virtual serial port
+
 
 #include "gvret.h"
 #include "canmanager.h"
@@ -158,9 +154,9 @@ void interpreteCANframe(const CANMessage &frame);
  **************************************************************************/
 //Task taskBlinkLED(500, TASK_FOREVER, &blinkLED, &runner, true);
 Task taskPrintStatus(500, TASK_FOREVER, &printStatus, &runner, true);
-Task taskSystemStateControl(100, TASK_FOREVER, [](){ systemState.run(); }, &runner, true);
+Task taskvControlControl(10, TASK_FOREVER, [](){ vControl.run(); }, &runner, true);
 Task taskVehicleDynamics(10, TASK_FOREVER, &control_dynamics, &runner, true);
-Task taskInjectSimulatedData(10, TASK_FOREVER, [](){ systemState.injectSimulatedData(); }, &runner, false); // Disabled by default
+Task taskInjectSimulatedData(10, TASK_FOREVER, [](){ vControl.injectSimulatedData(); }, &runner, false); // Disabled by default
 
 //---------------------------------------------------------------------------
 // Blacklist Array: Uncomment an ID to block it from being forwarded.
@@ -336,6 +332,8 @@ void interpreteCANframe(const CANMessage &frame)
     else if (frame.id == 0x236)
     { // Accelerator Pedal Percentage
         uint16_t rawSteering = (uint16_t)((frame.data[0] << 8) | frame.data[1]);
+        adsysHandler.sendSteeringAngle(rawSteering);
+        vControl.updateSteeringAngle(rawSteering);
         steering_angle = rawSteering - 4096; // div by 30.0 missing? -> According to https://myimiev.com/threads/can-network-reverse-engineering-creating-dbc-imiev.5788/ : Steering = (PID[0] * 256 + PID[1] - 4096) / 30.0;
     }
     else if (frame.id == 0x231)
@@ -359,6 +357,9 @@ void interpreteCANframe(const CANMessage &frame)
     }
     else if (frame.id == 0x418)
     { // Gear Shift Selection
+
+        vControl.updateGearSelection(frame.data[0]);
+
         switch (frame.data[0])
         {
         case 0x50:
@@ -529,7 +530,7 @@ void blinkLED()
 void control_dynamics()
 {
     pollJoystick();
-    control_acceleration();
+    //control_acceleration();
     control_brake_pedal();
 }
 
@@ -549,29 +550,38 @@ void pollJoystick()
     // Read the emergency button (active low, hence pressed = LOW)
     emergencyButtonPressed = false; // (digitalRead(EMERGENCY_BUTTON_PIN) == LOW);
     joystick_control_active = true; //!emergencyButtonPressed;
+
+
+    vControl.setTargetSteeringAngle((processedJoystickX + 100.0) / 2.0); // Map -100 to 100 -> 0 to 100%
 }
 
 void control_brake_pedal()
 {
-    // Compute error between target and actual position
-    float error = brake_pedal_target - (brake_pedal_position / 100);
+    // // Compute error between target and actual position
+    // float error = brake_pedal_target - (brake_pedal_position / 100);
 
-    // PID calculations
-    integral += error; // Accumulate integral term
-    float derivative = error - previous_error;
-    previous_error = error;
+    // // PID calculations
+    // integral += error; // Accumulate integral term
+    // float derivative = error - previous_error;
+    // previous_error = error;
 
-    // Compute PID output
-    float pid_output = (Kp * error) + (Ki * integral) + (Kd * derivative);
+    // // Compute PID output
+    // float pid_output = (Kp * error) + (Ki * integral) + (Kd * derivative);
 
-    // Apply the PID output to the servo position
-    servo_position += pid_output;
+    // // Apply the PID output to the servo position
+    // servo_position += pid_output;
 
-    // Constrain servo position within limits
-    servo_position = constrain(servo_position, SERVO_MIN_POSITION, SERVO_MAX_POSITION);
+    // // Constrain servo position within limits
+    // servo_position = constrain(servo_position, SERVO_MIN_POSITION, SERVO_MAX_POSITION);
 
     // Write the servo position
-    brake_servo.write(servo_position);
+    //brake_servo.write(servo_position);
+
+    brake_pedal_target += processedJoystickY * (10.0/1000.0);
+    vControl.setTargetBrakePosition(brake_pedal_target); // Map 0 to 1 -> 0 to 100%
+
+    //vControl.setTargetBrakePosition(brake_pedal_target * 100.0); // Map 0 to 1 -> 0 to 100%
+
 }
 
 void control_acceleration()
@@ -690,30 +700,30 @@ void control_acceleration()
 
 void printStatus()
 {
-    // MONITOR_PORT.print("Joystick X: ");
-    // MONITOR_PORT.print(processedJoystickX);
-    // MONITOR_PORT.print(" | Joystick Y: ");
-    // MONITOR_PORT.print(processedJoystickY);
-    // //MONITOR_PORT.print(" | Brake Pedal: ");
-    // //MONITOR_PORT.print(brake_pedal_position, 2);
-    // MONITOR_PORT.print(" | Torque Request: ");
-    // MONITOR_PORT.print(torque_request);
-    // MONITOR_PORT.print(" | Accelerator: ");
-    // MONITOR_PORT.print(accelerator_pedal_percentage, 2);
-    // //MONITOR_PORT.print(" | Gear: ");
-    // //MONITOR_PORT.print(gear_selection);
-    // //MONITOR_PORT.print(" | Emergency: ");
-    // //MONITOR_PORT.print(emergencyButtonPressed ? "PRESSED" : "NOT PRESSED");
-    // //MONITOR_PORT.print(" | Joystick Control: ");
-    // //MONITOR_PORT.print(joystick_control_active ? "ACTIVE" : "INACTIVE");
-    // //MONITOR_PORT.print(" | Brake Switch: ");
-    // //MONITOR_PORT.print(brake_pedal_switch ? "ON" : "OFF");
-    // MONITOR_PORT.print(" | Motor RPM: ");
-    // MONITOR_PORT.print(motor_rpm);
-    // MONITOR_PORT.print(" | Torque Theoretical: ");
-    // MONITOR_PORT.print(torque_theoretical);
-    // MONITOR_PORT.print(" | Torque Calculated: ");
-    // MONITOR_PORT.println(torque_request_calculated);
+    MONITOR_PORT.print("Joystick X: ");
+    MONITOR_PORT.print(processedJoystickX);
+    MONITOR_PORT.print(" | Joystick Y: ");
+    MONITOR_PORT.print(processedJoystickY);
+    //MONITOR_PORT.print(" | Brake Pedal: ");
+    //MONITOR_PORT.print(brake_pedal_position, 2);
+    MONITOR_PORT.print(" | Torque Request: ");
+    MONITOR_PORT.print(torque_request);
+    MONITOR_PORT.print(" | Accelerator: ");
+    MONITOR_PORT.print(accelerator_pedal_percentage, 2);
+    //MONITOR_PORT.print(" | Gear: ");
+    //MONITOR_PORT.print(gear_selection);
+    //MONITOR_PORT.print(" | Emergency: ");
+    //MONITOR_PORT.print(emergencyButtonPressed ? "PRESSED" : "NOT PRESSED");
+    //MONITOR_PORT.print(" | Joystick Control: ");
+    //MONITOR_PORT.print(joystick_control_active ? "ACTIVE" : "INACTIVE");
+    //MONITOR_PORT.print(" | Brake Switch: ");
+    //MONITOR_PORT.print(brake_pedal_switch ? "ON" : "OFF");
+    MONITOR_PORT.print(" | Motor RPM: ");
+    MONITOR_PORT.print(motor_rpm);
+    MONITOR_PORT.print(" | Torque Theoretical: ");
+    MONITOR_PORT.print(torque_theoretical);
+    MONITOR_PORT.print(" | Torque Calculated: ");
+    MONITOR_PORT.println(torque_request_calculated);
 }
 
 /**************************************************************************
@@ -726,6 +736,7 @@ void setup()
 
     // Initialize USB CDC for monitoring/debug output.
     USBSerial1.begin();
+    //USBSerial2.begin();
     USB.begin();
 
     // Initialize Servo
@@ -747,8 +758,8 @@ void setup()
     canManager_setup();
 
     // Set up AD System UART message callback
-    adsysHandler.setMessageCallback([&](const AdsysMessage &msg){ systemState.ADSystemMessagesCb(msg); });
-    systemState.adsysConnectionLostAction(); // set initial connection state
+    adsysHandler.setMessageCallback([&](const AdsysMessage &msg){ vControl.ADSystemMessagesCb(msg); });
+    vControl.adsysConnectionLostAction(); // set initial connection state
    
     // Optionally, print a startup message.
     MONITOR_PORT.println("System Initialized. Starting tasks...");

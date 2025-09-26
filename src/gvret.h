@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <ACAN2515.h>  // For CANMessage definition
+#include "main.h" // For GVRET_PORT definition
 
 // GVRET Protocol definitions
 #define CFG_BUILD_NUM 7010

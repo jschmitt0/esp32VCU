@@ -12,6 +12,7 @@
 enum class AdsysMsgType : uint8_t {
     HEARTBEAT        = 0x01,
     STEERING_ANGLE   = 0x02,
+    TORQUE_REQUEST   = 0x04,
     SET_SIMULATED_DATA_INJECTION = 0xF0,
     // Add more as needed...
 };
