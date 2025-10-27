@@ -1,338 +1,1357 @@
-#include <ESP32-TWAI-CAN.hpp>
-#include <params.h>
-#include <param_save.h>
-#include <FS.h>
-#include <SPIFFS.h>
+/*#if (!PLATFORMIO)
+  // Enable Arduino-ESP32 logging in Arduino IDE
+  #ifdef CORE_DEBUG_LEVEL
+    #undef CORE_DEBUG_LEVEL
+  #endif
+  #ifdef LOG_LOCAL_LEVEL
+    #undef LOG_LOCAL_LEVEL
+  #endif
+
+  #define CORE_DEBUG_LEVEL 4
+  #define LOG_LOCAL_LEVEL CORE_DEBUG_LEVEL
+#endif*/
+
+/**************************************************************************
+ *  Includes and Definitions
+ **************************************************************************/
 #include <Arduino.h>
-#include "cansdo.h"
+#include "USB.h"
+#include "USBCDC.h"
+#include <TaskScheduler.h>
+//#include <ESP32Servo.h>
 
-// Default for ESP32
-#define CAN_TX 21
-#define CAN_RX 20
+#include <WiFi.h>
 
-#define DESIG_UNIQUE_ID0 ((uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF))         // Lower 32 bits
-#define DESIG_UNIQUE_ID1 ((uint32_t)((ESP.getEfuseMac() >> 32) & 0xFFFFFFFF)) // Upper 32 bits
-#define DESIG_UNIQUE_ID2 (0x00000000)                                         // ESP32 does not have a 96-bit unique ID, so this is 0
+//#include "esp32-hal-log.h"
 
-CanSdo sdo;
+#include "adsystem_interface.h"
+#include "vehicle_control.h"
 
-void PrintList()
+#define INIT_USB_SERIAL 1
+
+#define USE_TASK_SCHEDULER 0 // use FreeRTOS tasks instead of TaskScheduler library
+
+#define STACK_SIZE_TASK_DEFAULT 2048
+
+StaticTask_t xPrintStatusTaskBuffer;
+StackType_t xStackTaskPrintStatus[STACK_SIZE_TASK_DEFAULT];
+StaticTask_t xVehicleControlRunTaskBuffer;
+StackType_t xStackTaskVehicleControlRun[STACK_SIZE_TASK_DEFAULT];
+StaticTask_t xVehicleControlSendStatusTaskBuffer;
+StackType_t xStackTaskVehicleControlSendStatus[STACK_SIZE_TASK_DEFAULT];
+StaticTask_t xVehicleDynamicsControlTaskBuffer;
+StackType_t xStackTaskVehicleDynamicsControl[STACK_SIZE_TASK_DEFAULT];
+
+#define POLL_JOYSTICK 0
+
+#if(INIT_USB_SERIAL==1)
+#define USBSERIAL_PRINTLN(x) USBSerial1.println(x)
+#else
+#define USBSERIAL_PRINTLN(x)
+#endif
+
+#define LOG_MAIN 1
+#if (LOG_MAIN==1)
+    #define LOG_MSG(x) sendDebugMessage(x)
+#else
+    #define LOG_MSG(x)
+#endif
+
+#define RX_TMP_BUF_SIZE 256
+uint8_t rxTmpBuf[RX_TMP_BUF_SIZE] = {};
+
+uint32_t totalBytesReceivedADSystem = 0;
+
+#define ADSYS_PORT Serial // try hardware serial for AD System serial port
+
+#if(INIT_USB_SERIAL==1)
+// USB Serial Setup: Use a clear name for the USB CDC object.
+USBCDC USBSerial1(0); // First virtual serial port
+#endif
+
+#include "canmanager.h"
+
+// RGB LED Config (ESP32-S3 Built-in)
+// #define RGB_BUILTIN    48   // Built-in LED pin on ESP32-S3
+// #define RGB_BRIGHTNESS 0    // 0 for OFF
+
+// Servo brake_servo;
+// const int servoPin = 17;
+// int pos = 0;
+
+// ——————————————————————————————————————————————————————————————————————————————
+//   Joystick Config (Analog Inputs)
+// ——————————————————————————————————————————————————————————————————————————————
+#define JOYSTICK_X_PIN 14 //4 // GPIO 4 for X-axis
+#define JOYSTICK_Y_PIN 4 //5 // GPIO 5 for Y-axis
+
+// Raw joystick values
+int rawJoystickX = 0;
+int rawJoystickY = 0;
+
+// Processed joystick values (-100% to 100%)
+float processedJoystickX = 0.0;
+float processedJoystickY = 0.0;
+double joystick_deadzone = 5.0; // percent
+
+// Calibration values (from your provided data)
+const int joystickX_ZERO = 1900; // X-axis center value
+const int joystickY_ZERO = 1940; // Y-axis center value
+
+const int JOYSTICK_MIN = 0;                  // Minimum raw ADC value
+const int JOYSTICK_MAX = 4095;               // Maximum raw ADC value
+const int JOYSTICK_RANGE = JOYSTICK_MAX / 2; // Half range for -100% to 100%
+
+// ——————————————————————————————————————————————————————————————————————————————
+//   Emergency Button Configuration
+// ——————————————————————————————————————————————————————————————————————————————
+// The emergency button is connected to pin 15.
+// Using INPUT_PULLUP makes it active low (pressed = LOW).
+const int EMERGENCY_BUTTON_PIN = 18;
+bool emergencyButtonPressed = false;
+
+/**************************************************************************
+ *  Global Variables and Objects
+ **************************************************************************/
+// joystick control signals
+bool joystick_control_active = false;
+bool joystick_error_flag = false;
+
+const float torque_ramp_accel = 20.0;             // torque acceleration ramp per 10ms
+const float torque_ramp_decell = 10.0;            // torque deceleration ramp per 10ms
+const float torque_max = 1000.0;                  // it seems like the iMiev allows 1800 here with full battery. Be carefull, this parameter can destroy the battery
+const float torque_min = -800.0;                  // max from iMiev with full battery is arround -1000. Be carefull, this parameter can destroy the battery
+const float torque_zero_space = 5.0;              // First 5% of joystick are zero zone in both directions
+const float torque_regen_cutoff_rpm_high = 300.0; // When the motor rpm is below this , stop  cutoff any negative torque regen -> Hysteresis control
+const float torque_regen_cutoff_rpm_low = 200.0;  // When the motor rpm is below this , start cutoff remaining negative torque regen -> Hysteresis control
+const float torque_regen_cutoff_rpm_full = 10.0;  // When the motor rpm is below this , cutoff to zero -> Hysteresis control
+float torque_theoretical = 0.0;                   // torque request before ramping
+float torque_request_internal = 0.0;              // torque request, before putting max on it
+float torque_request_calculated = 0.0;            // final torque before putting out to can
+double vehicle_speed_limit = 5.0; // km/h
+double vehicle_speed_limit_emergency = 15.0;
+double vehicle_speed = 0.0; // in km/h, read from iMiev via CAN
+double vehicle_speed_target = 0.0;
+double vehicle_speed_ramp_up = 0.01;    // 1 km/h per second at 10ms refresh rate
+double vehicle_speed_ramp_down = 0.01;  // 1 km/h per second at 10ms refresh rate
+
+int16_t ADSystemPhysicalAccelerationRequest = 0;
+
+
+uint8_t reverse_bit = 0;
+uint32_t last_reverse_toggle_time = 0;
+bool steeringControlHoldValue = true;
+bool holdingJoystickInDirectionReleased = true;
+
+uint32_t last_gear_switched_time = 0;
+const uint32_t gear_switch_safety_delay_ms = 5000;
+
+// ——————————————————————————————————————————————————————————————————————————————
+//   Brake Control
+// ——————————————————————————————————————————————————————————————————————————————
+// PID Control Constants (Tune these for optimal performance)
+const float Kp = 2.0; // Proportional gain
+const float Ki = 0.1; // Integral gain
+const float Kd = 0.5; // Derivative gain
+
+// Servo position limits
+const float SERVO_MIN_POSITION = -180.0; // Minimum servo position
+const float SERVO_MAX_POSITION = 180.0;  // Maximum servo position
+
+// PID variables
+double brake_pedal_target = 0.0; // Desired brake pedal position (0-100%)
+double brake_pedal_target_test = 0.0;   // Test variable for brake pedal position
+double steering_angle_target_test = 50.0; // Test variable for steering angle
+double torque_request_test = 0.0;      // Test variable for torque request
+
+float servo_position = 0.0;     // Servo output position
+
+// PID state variables
+float previous_error = 0.0;
+float integral = 0.0;
+
+// === Constants for Braking Logic ===
+const float BRAKE_RAMP_UP = 0.05;              // Rate of increase per cycle
+const float BRAKE_RAMP_DOWN = 0.1;             // Faster release to avoid brake drag
+const float PARK_BRAKE_TIME_THRESHOLD = 800.0; // Time in ms to engage park brake
+const float BRAKE_PARKING = 0.8;               // Value of target if in parking brake mode
+
+// === State Variables ===
+float brake_calculated = 0.0;      // Final brake application value
+unsigned long motor_zero_time = 0; // Time tracking for parking brake
+
+// ——————————————————————————————————————————————————————————————————————————————
+//   iMiev original signals
+// ——————————————————————————————————————————————————————————————————————————————
+float brake_pedal_position = 0.0;         // Scale factor: 0.39216
+float accelerator_pedal_percentage = 0.0; // Scale factor: 0.4
+char gear_selection = '?';                // Default empty
+int torque_request = 0;
+bool brake_pedal_switch = 0;
+int motor_rpm = 0;
+int steering_angle = 0;
+
+bool ignitionState = 0;
+
+double RPM_fl = 0.;
+double RPM_fr = 0.;
+double RPM_rl = 0.;
+double RPM_rr = 0.;
+uint8_t rangeKm = 0;
+double SoCValuePercent = 0.;
+
+byte torque_request_byte_0 = 0;
+byte torque_request_byte_1 = 0;
+
+// status
+bool heartbeat_rx_good = false;
+// operation modes (selected by switch):
+#define OPERATION_MODE_NORMAL 0 // normal (controlled by AD system)
+#define OPERATION_MODE_ERROR  1 // error
+#define OPERATION_MODE_TEST   2 // test (controlled by ECU)
+uint8_t operation_mode = OPERATION_MODE_NORMAL;
+
+
+String esp_reset_reason_array[] = {
+    "ESP_RST_UNKNOWN",    //!< Reset reason can not be determined
+    "ESP_RST_POWERON",    //!< Reset due to power-on event
+    "ESP_RST_EXT",        //!< Reset by external pin (not applicable for ESP32)
+    "ESP_RST_SW",         //!< Software reset via esp_restart
+    "ESP_RST_PANIC",      //!< Software reset due to exception/panic
+    "ESP_RST_INT_WDT",    //!< Reset (software or hardware) due to interrupt watchdog
+    "ESP_RST_TASK_WDT",   //!< Reset due to task watchdog
+    "ESP_RST_WDT",        //!< Reset due to other watchdogs
+    "ESP_RST_DEEPSLEEP",  //!< Reset after exiting deep sleep mode
+    "ESP_RST_BROWNOUT",   //!< Brownout reset (software or hardware)
+    "ESP_RST_SDIO"       //!< Reset over SDIO
+};
+
+uint32_t avgN = 100;
+double avgExecTimeMsScheduler = 0.0;
+double avgExecTimeMsPollCAN = 0.0;
+double avgExecTimeMsRcADSys = 0.0;
+
+double avgExecTimeDC = 0.0;
+double avgExecTimePS = 0.0;
+double avgExecTimeVCSS = 0.0;
+double avgExecTimeVCRun = 0.0;
+
+size_t loopPeriodsCounter = 0;
+
+uint32_t maxInASecExecTimeMsScheduler = 0.0;
+uint32_t maxInASecExecTimeMsPollCAN = 0.0;
+uint32_t maxInASecExecTimeMsRcADSys = 0.0;
+
+uint32_t maxInASecExecTimeMsDC = 0.0;
+uint32_t maxInASecExecTimeMsPS = 0.0;
+uint32_t maxInASecExecTimeMsVCSS = 0.0;
+uint32_t maxInASecExecTimeMsVCRun = 0.0;
+
+uint32_t motorInjPerSeconds = 0;
+
+#if(USE_TASK_SCHEDULER==1)
+Scheduler runner;
+#endif
+
+/**************************************************************************
+ *  Function Prototypes
+ **************************************************************************/
+void pollCAN();
+void manipulateCAN();
+void passthroughCAN();
+void printStatus();
+void control_dynamics();
+void control_acceleration();
+void pollJoystick();
+void control_brake_pedal();
+void interpreteCANframe(const CANMessage &frame);
+
+/**************************************************************************
+ *  Task Definitions
+ **************************************************************************/
+#if(USE_TASK_SCHEDULER==1)
+#if(INIT_USB_SERIAL==1)
+Task taskPrintStatus(1000, TASK_FOREVER, &printStatus, &runner, true);
+#endif
+Task taskvControlRun(10, TASK_FOREVER, [](){ vControl.run(); }, &runner, true);
+Task taskvControlSendStatus(250, TASK_FOREVER, [](){ vControl.sendStatus(); }, &runner, true);
+Task taskVehicleDynamics(10, TASK_FOREVER, &control_dynamics, &runner, true);
+#else
+#if(INIT_USB_SERIAL==1)
+void xPrintStatus(void * parameter)
 {
-    Serial.println("Available parameters and values:");
+  for(;;)
+  {
+    uint32_t startTime = millis();
+    printStatus();
 
-    for (uint32_t idx = 0; idx < Param::PARAM_LAST; idx++)
+    uint32_t execTime = millis() - startTime;
+    avgExecTimePS = ((avgExecTimePS * (avgN - 1)) + execTime) / avgN;
+    if(execTime > maxInASecExecTimeMsPS)
+      maxInASecExecTimeMsPS = execTime;
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+#endif
+void xVehicleDynamics(void * parameter)
+{
+  for(;;)
+  {
+    uint32_t startTime = millis();
+    control_dynamics();
+
+    uint32_t execTime = millis() - startTime;
+    avgExecTimeDC = ((avgExecTimeDC * (avgN - 1)) + execTime) / avgN;
+    if(execTime > maxInASecExecTimeMsDC)
+      maxInASecExecTimeMsDC = execTime;
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+void xVehicleControlRun(void * parameter)
+{
+  for(;;)
+  {
+    uint32_t startTime = millis();
+    vControl.run();
+    uint32_t execTime = millis() - startTime;
+    avgExecTimeVCRun = ((avgExecTimeVCRun * (avgN - 1)) + execTime) / avgN;
+    if(execTime > maxInASecExecTimeMsVCRun)
+      maxInASecExecTimeMsVCRun = execTime;
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+void xVehicleControlSendStatus(void * parameter)
+{
+  for(;;)
+  {
+    uint32_t startTime = millis();
+    vControl.sendStatus();
+    uint32_t execTime = millis() - startTime;
+    avgExecTimeVCSS = ((avgExecTimeVCSS * (avgN - 1)) + execTime) / avgN;
+    if(execTime > maxInASecExecTimeMsVCSS)
+      maxInASecExecTimeMsVCSS = execTime;
+    vTaskDelay(250 / portTICK_PERIOD_MS);
+  }
+}
+#endif
+
+
+//---------------------------------------------------------------------------
+// Blacklist Array: Uncomment an ID to block it from being forwarded.
+// If the ID is commented out, it is allowed to be forwarded.
+//---------------------------------------------------------------------------
+static const uint32_t BLACKLISTED_CAN_IDS[] = {
+    0x100, // One Time Startup message - not cyclic
+    0x110, // One Time Startup message - not cyclic
+    0x111, // One Time Startup message - not cyclic
+    0x101, // Blacklist this ID
+    0x119, // Allow: ID 0x119
+    0x149, // Allow: ID 0x149
+    0x156, // Allow: ID 0x156
+    0x200, // Allow: Wheel front
+    0x208, // Allow: Wheel back + brake pedal
+    0x210, // Allow: Accelerator pedal
+    0x212, // Allow: Relation with voltage/current (traction battery)
+    0x215, // Allow: Actual speed and distance travelled
+    0x231, // Allow: Brake pedal switch
+    0x236, // Allow: ID 0x236
+    // 0x285, // Allow: acceleration -> triggers error in instrument cluster propoably reduction of torque by esp ?
+    0x286, // Allow: -> only at start and end of the ride? maybe gear selection?
+    // 0x288, // Allow: Motor message so not on this bus anyway
+    // 0x298, // Allow: Motor message so not on this bus anyway
+    // 0x29A, // Allow: Motor message so not on this bus anyway
+    0x2F2, // Allow: ID 0x2F2
+    0x300, // Allow: ID 0x300
+    0x308, // Allow: ID 0x308
+    0x325, // Allow: ID 0x325
+    0x346, // Allow: ID 0x346
+    0x373, // Allow: ID 0x373
+    0x374, // Allow: ID 0x374
+    0x375, // Allow: ID 0x375
+    0x384, // Allow: ID 0x384
+    0x385, // Allow: ID 0x385
+    0x3A4, // Allow: ID 0x3A4
+    0x408, // Allow: ID 0x408
+    0x412, // Allow: ID 0x412
+    0x418, // Allow: Gear shift selection
+    0x424, // Allow: ID 0x424
+    // 0x564, // Allow: Motor message so not on this bus anyway
+    // 0x565, // Allow: Motor message so not on this bus anyway
+    0x5A1, // Allow: ID 0x5A1
+    0x695, // Blacklist: Unknown message
+    0x696, // Blacklist: Motor current and regen amps
+    0x697, // Allow: ID 0x697
+    0x6D0, // Allow: ID 0x6D0
+    0x6D1, // Allow: ID 0x6D1
+    0x6D2, // Allow: ID 0x6D2
+    0x6D3, // Allow: ID 0x6D3
+    0x6D4, // Allow: ID 0x6D4
+    0x6D5, // Allow: ID 0x6D5
+    0x6D6, // Allow: ID 0x6D6
+    0x6DA, // Allow: ID 0x6DA
+    0x6E1, // Allow: ID 0x6E1
+    0x6E2, // Allow: ID 0x6E2
+    0x6E3, // Allow: ID 0x6E3
+    0x6E4, // Allow: ID 0x6E4
+    0x6FA, // Allow: ID 0x6FA
+    // 0x75A, // Allow: Motor message
+    // 0x75B  // Allow: Motor message
+};
+
+//---------------------------------------------------------------------------
+// Helper Function: Returns true if the given CAN ID is blacklisted.
+//---------------------------------------------------------------------------
+bool isBlacklisted(uint32_t canId)
+{
+    const size_t numIDs = sizeof(BLACKLISTED_CAN_IDS) / sizeof(BLACKLISTED_CAN_IDS[0]);
+    for (size_t i = 0; i < numIDs; i++)
     {
-        const Param::Attributes *pAtr = Param::GetAttrib((Param::PARAM_NUM)idx);
-
-        if ((Param::GetFlag((Param::PARAM_NUM)idx) & Param::FLAG_HIDDEN) == 0)
+        if (BLACKLISTED_CAN_IDS[i] == canId)
         {
-            Serial.print(pAtr->name);
-            Serial.print(" [");
-            Serial.print(pAtr->unit);
-            Serial.println("]");
+            return true;
         }
     }
+    return false;
 }
 
-void PrintParamsJson()
+//---------------------------------------------------------------------------
+// Manipulate messages here.
+//---------------------------------------------------------------------------
+void manipulate_0x285(const CANMessage &inFrame, CANMessage &outFrame)
 {
-    Serial.println("{");
-    char comma = ' '; // Tracks whether to print a comma
+    // 1) Copy all message metadata and bytes initially
+    outFrame.id = inFrame.id;
+    outFrame.len = inFrame.len;
+    outFrame.data[0] = inFrame.data[0];
+    outFrame.data[1] = inFrame.data[1];
+    outFrame.data[2] = inFrame.data[2];
+    outFrame.data[3] = inFrame.data[3];
+    outFrame.data[4] = inFrame.data[4];
+    outFrame.data[5] = inFrame.data[5];
+    outFrame.data[6] = inFrame.data[6];
+    outFrame.data[7] = inFrame.data[7];
+    
+    torque_request_byte_0 = inFrame.data[0];
+    torque_request_byte_1 = inFrame.data[1];
 
-    for (uint32_t idx = 0; idx < Param::PARAM_LAST; idx++)
+    // 2) Interpret the first two bytes as big-endian unsigned 16-bit
+    //    data[0] is MSB, data[1] is LSB
+    uint16_t rawAcceleration = (uint16_t)((outFrame.data[0] << 8) | outFrame.data[1]);
+
+    // 3) Convert to physical value using scale=1, bias=-2000
+    //    physical = raw - 2000
+    int16_t physicalAcceleration = (int16_t)rawAcceleration - 2000;
+
+    torque_request = physicalAcceleration;
+
+    // 4) Example manipulation: ensure the physical value is never negative
+    // if (physicalAcceleration < 0) {
+    //     physicalAcceleration = 0;
+    // }
+
+    // if (physicalAcceleration < 0)
+    // {
+    //     if (outFrame.data[7] == 0x10)
+    //     {
+    //         physicalAcceleration = physicalAcceleration * 3;
+    //     }
+    // }
+
+    VehicleControl::OperationMode vControlMode = vControl.getOperationMode();
+
+    if (vControlMode == VehicleControl::ECUTestControl && vControl.getTestMode() == VehicleControl::TestMode::Test_BrakeSteeringActuatorJoystick)
     {
-        const Param::Attributes *pAtr = Param::GetAttrib((Param::PARAM_NUM)idx);
-
-        // Always include parameters (hidden or not)
-        Serial.print(comma);
-        Serial.println();
-        Serial.print("   \"");
-        Serial.print(pAtr->name);
-        Serial.print("\": {\"unit\":\"");
-        Serial.print(pAtr->unit);
-        Serial.print("\",\"id\":");
-        Serial.print(pAtr->id);
-        Serial.print(",\"value\":");
-        Serial.print(Param::Get((Param::PARAM_NUM)idx));
-        Serial.print(",");
-
-        // Include parameter type and additional attributes
-        if (Param::GetType((Param::PARAM_NUM)idx) == Param::TYPE_PARAM ||
-            Param::GetType((Param::PARAM_NUM)idx) == Param::TYPE_TESTPARAM)
+        physicalAcceleration = 0;
+    }
+    else if(vControlMode == VehicleControl::ECUTestControl && vControl.getTestMode() == VehicleControl::TestMode::Test_FullSystem)
+    {
+        //LOG_MSG("physicalAcceleration = torque_request_calculated: " + String(torque_request_calculated));
+        physicalAcceleration = torque_request_calculated;
+    }
+    else if(vControlMode == VehicleControl::OperationMode::ADSystemControl)
+    {
+        // safety measure
+        if(vControl.isAdsystemConnected())
         {
-            Serial.print("\"isparam\":true,\"minimum\":");
-            Serial.print(pAtr->min);
-            Serial.print(",\"maximum\":");
-            Serial.print(pAtr->max);
-            Serial.print(",\"default\":");
-            Serial.print(pAtr->def);
-            Serial.print(",\"category\":\"");
-            Serial.print(pAtr->category);
-            Serial.print("\",\"i\":");
-            Serial.print(idx);
-            Serial.print("}");
+            physicalAcceleration = ADSystemPhysicalAccelerationRequest;
         }
         else
         {
-            Serial.print("\"isparam\":false}");
+            physicalAcceleration = 0;
+        }
+    }
+
+    // safety measure
+    if(millis() < last_gear_switched_time + gear_switch_safety_delay_ms) // caution: fails after 49.7 days of continuous run time (will override physicalAcceleration to zero until last_gear_switched_time + gear_switch_safety_delay_ms is reached again or gear was switched again)
+    {
+        physicalAcceleration = 0;
+    }
+
+    // 5) Convert back to raw: raw = physical + 2000
+        rawAcceleration = (uint16_t)(physicalAcceleration + 2000);
+
+    // 6) Store the manipulated raw value back in big-endian format
+    outFrame.data[0] = (uint8_t)((rawAcceleration >> 8) & 0xFF); // MSB
+    outFrame.data[1] = (uint8_t)(rawAcceleration & 0xFF);        // LSB
+
+    if(vControlMode == VehicleControl::OperationMode::ECUTestControl && vControl.getTestMode() == VehicleControl::TestMode::Test_InverterJoystick)
+    {
+        outFrame.data[7] = reverse_bit;
+    }
+}
+
+void manipulate_0x288(const CANMessage &inFrame, CANMessage &outFrame)
+{
+    // 1) Copy all message metadata and bytes initially
+    outFrame.id = inFrame.id;
+    outFrame.len = inFrame.len;
+    outFrame.data[0] = torque_request_byte_0; // Maybe the ecu notices the manipulation of troque request, because those two bytes dows not reflect the actual expected torque
+    outFrame.data[1] = torque_request_byte_1;
+    outFrame.data[2] = inFrame.data[2];
+    outFrame.data[3] = inFrame.data[3];
+    outFrame.data[4] = inFrame.data[4];
+    outFrame.data[5] = inFrame.data[5];
+    outFrame.data[6] = inFrame.data[6];
+    outFrame.data[7] = inFrame.data[7];
+}
+
+void interpreteCANframe(const CANMessage &frame)
+{
+    // Interpret messages based on their ID.
+    if (frame.id == 0x101)
+    {
+        // Key
+        bool newIgnitionState = (frame.data[0] == 0x04)?true:false;
+        if(ignitionState != newIgnitionState)
+        {
+            if(!newIgnitionState)
+            {
+                vControl.VehicleStateIgnitionChangedToOff();
+            }
+        }
+        ignitionState = (frame.data[0] == 0x04)?true:false;
+    }
+    else if (frame.id == 0x200)
+    { // Wheel Rotation front
+        uint16_t RPM_fl_raw = (frame.data[2] << 8) + frame.data[3]; // front left
+        uint16_t RPM_fr_raw = (frame.data[4] << 8) + frame.data[5]; // front right
+        RPM_fl = ((double) RPM_fl_raw - 49152.) / 19.;
+        RPM_fr = ((double) RPM_fr_raw - 49152.) / 19.;
+        
+        //adsysHandler.sendMessage(AdsysMsgType::RPM_FRONT_LR, &(frame.data[2]), 4);
+
+        //LOG_MSG("0x200: d[2]: 0x" + String(frame.data[2], HEX) + " | d[3]: 0x" + String(frame.data[3], HEX) + " | d[4]: 0x" + String(frame.data[4], HEX) + " | d[5]: 0x" + String(frame.data[5], HEX));
+        //LOG_MSG("0x200: uint16_t RPM_fl_raw: " + String(RPM_fl_raw) + " |  uint16_t RPM_fr_raw: " + String(RPM_fr_raw) + " | RPM_fl: " + String(RPM_fl) + " | RPM_fr: " + String(RPM_fr));
+    }
+    else if (frame.id == 0x208)
+    { // Wheel Rotation rear, Brake Position
+        uint8_t raw_brake_value = frame.data[3];
+        brake_pedal_position = raw_brake_value * 0.25 - 6144.5;
+
+        uint16_t RPM_rr_raw = (frame.data[4] << 8) + frame.data[5]; // front right
+        uint16_t RPM_rl_raw = (frame.data[6] << 8) + frame.data[7]; // front left
+        RPM_rr = ((double) RPM_rr_raw - 49152.) / 19.;
+        RPM_rl = ((double) RPM_rl_raw - 49152.) / 19.;
+
+        //LOG_MSG("0x208: d[4]: 0x" + String(frame.data[4], HEX) + " | d[5]: 0x" + String(frame.data[5], HEX) + " | d[6]: 0x" + String(frame.data[6], HEX) + " | d[7]: 0x" + String(frame.data[7], HEX));
+        //LOG_MSG("0x208: uint16_t RPM_rl_raw: " + String(RPM_rl_raw) + " |  uint16_t RPM_rr_raw: " + String(RPM_rr_raw) + " | RPM_rl: " + String(RPM_rl) + " | RPM_rr: " + String(RPM_rr));
+  
+        //adsysHandler.sendMessage(AdsysMsgType::RPM_REAR_RL, &(frame.data[4]), 4);
+    }
+    else if (frame.id == 0x210)
+    { // Accelerator Pedal Percentage
+        uint8_t raw_accel_value = frame.data[2];
+        accelerator_pedal_percentage = raw_accel_value * 0.4;
+    }
+    else if (frame.id == 0x215)
+    { // Vehicle speed
+        uint16_t raw_vehicle_speed_value_uint16 = (frame.data[0] << 8) + frame.data[1];
+        int16_t raw_vehicle_speed_value = *(int16_t *) &raw_vehicle_speed_value_uint16; // reinterprete as int16_t
+        vehicle_speed = (double) raw_vehicle_speed_value * 0.0078125;
+        if(vehicle_speed >= vehicle_speed_limit_emergency || vehicle_speed <= -vehicle_speed_limit_emergency)
+        {
+            //vControl.setEmergencyMode();
+            //LOG_MSG("vehicle speed larger than vehicle_speed_emergency. Opened safety circuit.");
         }
 
-        comma = ','; // Add a comma after the first parameter
+        adsysHandler.sendMessage(AdsysMsgType::SPEED, &(frame.data[0]), 2);
     }
+    else if (frame.id == 0x236)
+    { // Accelerator Pedal Percentage
+        uint16_t rawSteering = (uint16_t)((frame.data[0] << 8) | frame.data[1]);
+        adsysHandler.sendMessage(AdsysMsgType::STEERING_ANGLE, &(frame.data[0]), 2);
 
-    // Add a unique identifier as part of the JSON object
-    Serial.println(",");
-    Serial.print("   \"serial\": {\"unit\":\"\",\"value\":\"");
-    Serial.print("12345678"); // Replace "12345678" with actual unique ID logic if available
-    Serial.println("\",\"isparam\":false}");
-    Serial.println("}");
-}
-
-void sendObdFrame(uint8_t obdId)
-{
-    CanFrame obdFrame = {0};
-    obdFrame.identifier = 0x7DF; // Default OBD2 address;
-    obdFrame.extd = 0;
-    obdFrame.data_length_code = 8;
-    obdFrame.data[0] = 2;
-    obdFrame.data[1] = 1;
-    obdFrame.data[2] = obdId;
-    obdFrame.data[3] = 0xAA; // Best to use 0xAA (0b10101010) instead of 0
-    obdFrame.data[4] = 0xAA; // CAN works better this way as it needs
-    obdFrame.data[5] = 0xAA; // to avoid bit-stuffing
-    obdFrame.data[6] = 0xAA;
-    obdFrame.data[7] = 0xAA;
-    // Accepts both pointers and references
-    ESP32Can.writeFrame(obdFrame); // timeout defaults to 1 ms
-}
-
-void Param::Change(Param::PARAM_NUM paramNum)
-{
-    switch (paramNum)
+        vControl.updateSteeringAngle(rawSteering);
+        //LOG_MSG("Got CAN Msg Steering angle raw: " + String(rawSteering));
+        steering_angle = rawSteering - 4096; // div by 30.0 missing? -> According to https://myimiev.com/threads/can-network-reverse-engineering-creating-dbc-imiev.5788/ : Steering = (PID[0] * 256 + PID[1] - 4096) / 30.0;
+    }
+    else if (frame.id == 0x231)
+    { // 0x231 message: 5 bytes message with Brake_Pedal_Switch_Sensor
+        // According to the DBC, Brake_Pedal_Switch_Sensor is at bit 32, length 8, big-endian, signed.
+        // In a 5-byte message, the 5th byte (index 4) contains bits 32-39.
+        brake_pedal_switch = ((int8_t)frame.data[4] > 0);
+    }
+    else if (frame.id == 0x288)
     {
-    default:
-        // Handle general parameter changes here. Add paramNum labels for handling specific parameters
-        break;
+        // Extract motor_rpm from data[2] (MSB) and data[3] (LSB) in big-endian
+        uint16_t rawRpm = (uint16_t)((frame.data[2] << 8) | frame.data[3]);
+        // Convert raw value to physical value using scale = 1 and offset = -10000.
+        // That is, physical_rpm = rawRpm - 10000.
+        motor_rpm = (int16_t)rawRpm - 10000;
+
+        //adsysHandler.sendMessage(AdsysMsgType::RPM_MOTOR, &(frame.data[2]), 2);
     }
-}
-
-File jsonParamFile; // Global file object for params.json
-
-bool initializeSPIFFSAndLoadFile()
-{
-    // Initialize SPIFFS
-    if (!SPIFFS.begin(true))
+    else if (frame.id == 0x346)
     {
-        Serial.println("Failed to mount SPIFFS");
-        return false;
+        // Range
+        rangeKm = frame.data[7];
+        vControl.VehicleStateUpdateRangeKm(rangeKm);
+        //adsysHandler.sendMessage(AdsysMsgType::BATTERY_RANGE, &(frame.data[7]), 1);
     }
+    else if (frame.id == 0x374)
+    {        
+        uint16_t SoCRaw = (uint16_t)(frame.data[1]);
+        int32_t SoCOffset = -10;
+        double SoCFactor = 0.5;
+        SoCValuePercent = (SoCRaw + SoCOffset) * SoCFactor;
+        
+        vControl.VehicleStateUpdateBatterySoC(frame.data[1]);
+        //adsysHandler.sendMessage(AdsysMsgType::BATTERY_SOC, &(frame.data[1]), 1);
 
-    // Open the params.json file
-    jsonParamFile = SPIFFS.open("/params.json", FILE_READ);
-    if (!jsonParamFile)
-    {
-        Serial.println("Failed to open params.json for reading.");
-        SPIFFS.end(); // Unmount SPIFFS before returning
-        return false;
+        //LOG_MSG("SoCRaw: " + String(SoCRaw) + " | SoCValuePercent: " + String(SoCValuePercent));
     }
-    return true;
-}
+    else if (frame.id == 0x418)
+    { // Gear Shift Selection
 
-void PrintParamsJsonfromfile()
-{
-    // Initialize SPIFFS
-    if (!SPIFFS.begin(true))
-    { // Mount SPIFFS (format if necessary)
-        Serial.println("Failed to mount SPIFFS");
-        return;
-    }
-
-    // Open the file for reading
-    File file = SPIFFS.open("/params.json", FILE_READ);
-    if (!file)
-    {
-        Serial.println("Failed to open file for reading");
-        SPIFFS.end();
-        return;
-    }
-
-    // Read the contents of the file and print them line by line
-    Serial.println("Contents of params.json:");
-    while (file.available())
-    {
-        Serial.write(file.read());
-    }
-
-    Serial.println(); // Add a newline after printing the file contents
-    file.close();
-    SPIFFS.end(); // Unmount SPIFFS
-}
-
-// Function to write all parameters to a JSON file, always including hidden ones
-void WriteParamsJsonToFlash()
-{
-    const Param::Attributes *pAtr;
-
-    // Initialize SPIFFS
-    if (!SPIFFS.begin(true))
-    { // Format if necessary
-        Serial.println("Failed to mount SPIFFS");
-        return;
-    }
-
-    // Open the file for writing
-    File file = SPIFFS.open("/params.json", FILE_WRITE);
-    if (!file)
-    {
-        Serial.println("Failed to open file for writing");
-        SPIFFS.end();
-        return;
-    }
-
-    // Start JSON
-    file.print("{\r\n");
-
-    // Iterate through parameters
-    bool firstParam = true; // Flag to track the first parameter
-    for (uint32_t idx = 0; idx < Param::PARAM_LAST; idx++)
-    {
-        uint32_t canId;
-        uint8_t canStart;
-        int8_t canLength, offset;
-        bool isRx;
-        float canGain;
-
-        pAtr = Param::GetAttrib((Param::PARAM_NUM)idx);
-
-        // Add a comma only if it's not the first parameter
-        if (!firstParam)
+        if(gear_selection != frame.data[0])
         {
-            file.print(",\r\n");
+            // gear was switched
+            last_gear_switched_time = millis();
+            setPhysicalAccelerationRequest(0); // safety measure
+
+            switch (frame.data[0])
+            {
+            case 0x50:
+                gear_selection = 'P';
+                break;
+            case 0x52:
+                gear_selection = 'R';
+                break;
+            case 0x4E:
+                gear_selection = 'N';
+                break;
+            case 0x44:
+                gear_selection = 'D';
+                break;
+            case 0x83:
+                gear_selection = 'B';
+                break;
+            case 0x32:
+                gear_selection = 'C';
+                break;
+            default:
+                gear_selection = '?';
+                break;
+            }
+
+            vControl.updateGearSelection(gear_selection);
+            adsysHandler.sendMessage(AdsysMsgType::GEAR_SELECTION, (uint8_t *) &gear_selection, 1);
         }
-        firstParam = false;
+    }
+}
 
-        // Write parameter information
-        file.print("   \"");
-        file.print(pAtr->name);
-        file.print("\": {\"unit\":\"");
-        file.print(pAtr->unit);
-        file.print("\",\"id\":");
-        file.print(pAtr->id);
-        file.print(",\"value\":");
-        file.print(Param::Get((Param::PARAM_NUM)idx));
-        file.print(",");
+/**************************************************************************
+ *  CAN Bus and Task Functions
+ **************************************************************************/
+void manipulateCAN()
+{
+    CANMessage frame;
 
-        // Include parameter type and additional attributes
-        if (Param::GetType((Param::PARAM_NUM)idx) == Param::TYPE_PARAM ||
-            Param::GetType((Param::PARAM_NUM)idx) == Param::TYPE_TESTPARAM)
+    // -------------------------------------------------------------
+    // Handle messages from CAN1 - Motor CAN bus
+    // -------------------------------------------------------------
+    if (can_motor.available()) //This is motor can bus
+    {
+        can_motor.receive(frame);
+        interpreteCANframe(frame);
+
+        // Check if this message needs manipulation.
+        if (frame.id == 0x288) // Manipulate motor response to make torque request match
         {
-            file.print("\"isparam\":true,\"minimum\":");
-            file.print(pAtr->min);
-            file.print(",\"maximum\":");
-            file.print(pAtr->max);
-            file.print(",\"default\":");
-            file.print(pAtr->def);
-            file.print(",\"category\":\"");
-            file.print(pAtr->category);
-            file.print("\",\"i\":");
-            file.print(idx);
-            file.print("}");
+            CANMessage outFrame;
+            manipulate_0x288(frame, outFrame);
+            can_vehicle.tryToSend(outFrame);
         }
         else
         {
-            file.print("\"isparam\":false}");
+            // For all other forwards as is
+            can_vehicle.tryToSend(frame);
         }
     }
 
-    // Add the unique identifier
-    uint32_t uniqueID0 = DESIG_UNIQUE_ID0; // Lower 32 bits
-    uint32_t uniqueID1 = DESIG_UNIQUE_ID1; // Upper 32 bits
-    uint32_t uniqueID2 = DESIG_UNIQUE_ID2; // Placeholder for 0
-
-    if (!firstParam)
+    // -------------------------------------------------------------
+    // Handle messages from CAN2 - Vehicle CAN bus
+    // -------------------------------------------------------------
+    if (can_vehicle.available())
     {
-        file.print(",\r\n");
+        can_vehicle.receive(frame);
+        interpreteCANframe(frame);
+       
+        // Only process messages that are not blacklisted.
+        if (!isBlacklisted(frame.id))
+        {
+            // Check if this message needs manipulation.
+            if (frame.id == 0x285) // Motor Control functions
+            {
+                CANMessage outFrame;
+                manipulate_0x285(frame, outFrame);
+                can_motor.tryToSend(outFrame);
+                motorInjPerSeconds++;
+            }
+            else
+            {
+                // For all other not-blacklisted IDs, forward as is.
+                can_motor.tryToSend(frame);
+            }
+        }
+        else
+        {
+            // Optionally log that the message was blacklisted/dropped.
+            // LOG_MSG("Dropping blacklisted CAN id: 0x" + String(frame.id, HEX));
+        }
     }
-    file.print("   \"serial\": {\"unit\":\"\",\"value\":\"");
-    file.printf("%08X%08X%08X", uniqueID1, uniqueID0, uniqueID2); // Concatenate the IDs
-    file.print("\",\"isparam\":false}");
-    file.print("\r\n}");
-
-    file.close(); // Close the file
-    SPIFFS.end(); // Unmount SPIFFS
-
-    Serial.println("JSON file written successfully to flash with all parameters, including hidden ones");
 }
 
+void passthroughCAN()
+{
+    CANMessage frame;
+
+    // -------------------------------------------------------------
+    // Handle messages from CAN1 - Motor CAN bus
+    // -------------------------------------------------------------
+    if (can_motor.available())
+    {
+        can_motor.receive(frame);
+        interpreteCANframe(frame);
+
+        can_vehicle.tryToSend(frame);
+    }
+
+    // -------------------------------------------------------------
+    // Handle messages from CAN2 - Vehicle CAN bus
+    // -------------------------------------------------------------
+    if (can_vehicle.available())
+    {
+        can_vehicle.receive(frame);
+        interpreteCANframe(frame);
+        
+        can_motor.tryToSend(frame);
+    }
+}
+
+void pollCAN()
+{
+    // always do the manipulation
+    manipulateCAN();
+}
+
+// ——————————————————————————————————————————————————————————————————————————————
+//   Control Vehicle Dynamics (Every 10ms)
+// ——————————————————————————————————————————————————————————————————————————————
+void control_dynamics()
+{
+    //LOG_MSG("EnmCD");
+    pollJoystick();
+    control_acceleration();
+    control_brake_pedal();
+    //LOG_MSG("ExmCD");
+}
+
+double Xavg = 0;
+double Yavg = 0;
+
+void pollJoystick()
+{
+    if(vControl.getOperationMode() == VehicleControl::OperationMode::ADSystemControl)
+    {
+        return;
+    }
+
+#if(POLL_JOYSTICK==1)
+    rawJoystickX = analogRead(JOYSTICK_X_PIN); // Read X-axis
+    rawJoystickY = analogRead(JOYSTICK_Y_PIN); // Read Y-axis
+#else
+    rawJoystickX = joystickX_ZERO; // Center position
+    rawJoystickY = joystickY_ZERO; // Center position
+#endif
+    /*
+    // in the current setup: Xavg = ~1900, Yavg = ~1940
+    double cnt = 1000;
+    Xavg = (Xavg * (cnt -1) + (double) rawJoystickX) / cnt;
+    Yavg = (Yavg * (cnt -1) + (double) rawJoystickY) / cnt;
+
+    LOG_MSG("rawJoystickX: " + String(rawJoystickX) + ", rawJoystickY: " + String(rawJoystickY));
+    LOG_MSG("running avg rawJoystickX: " + String(Xavg) + ", running avg rawJoystickY: " + String(Yavg));*/
+
+
+    // Convert to -100% to 100% range
+    processedJoystickX = ((rawJoystickX - joystickX_ZERO) / (float)JOYSTICK_RANGE) * 100.0;
+    processedJoystickY = ((rawJoystickY - joystickY_ZERO) / (float)JOYSTICK_RANGE) * 100.0;
+
+    // Constrain values to -100% to 100%
+    processedJoystickX = constrain(processedJoystickX, -100, 100);
+    processedJoystickY = constrain(processedJoystickY, -100, 100);
+
+    // Read the emergency button (active low, hence pressed = LOW)
+    emergencyButtonPressed = false; // (digitalRead(EMERGENCY_BUTTON_PIN) == LOW);
+    joystick_control_active = true; //!emergencyButtonPressed;
+
+    if(vControl.getOperationMode() == VehicleControl::OperationMode::ECUTestControl)
+    {
+        double steeringInputPercent = (processedJoystickX<=-joystick_deadzone || processedJoystickX >= joystick_deadzone)?processedJoystickX/(100.0-joystick_deadzone):0.0;
+
+        if(vControl.getTestMode() == VehicleControl::TestMode::Test_None || vControl.getTestMode() == VehicleControl::TestMode::Test_FullSystem)
+        {
+            if(steeringControlHoldValue)
+            {
+                bool holdingJoystickInDirection = (processedJoystickX > joystick_deadzone)?true:((processedJoystickX < -joystick_deadzone)?true:false);
+                
+                //LOG_MSG("holdingJoystickInDirection is: " + String(holdingJoystickInDirection));
+                if(holdingJoystickInDirection)
+                {
+                    double anglePer = (processedJoystickX>0.0)?0.0:100.0;
+                    vControl.setTargetSteeringAngle(anglePer);
+                    holdingJoystickInDirectionReleased = false;
+                    //LOG_MSG("Holding steering input. Set target steering angle to: " + String(anglePer));
+                }
+                else if(holdingJoystickInDirectionReleased == false)
+                {
+                    LOG_MSG("Released steering input. Set target to current steering angle. vControl.getSteeringAnglePercent():" + String(vControl.getSteeringAnglePercent()));
+                    vControl.setTargetSteeringAngle(vControl.getSteeringAnglePercent());
+                    holdingJoystickInDirectionReleased = true;
+                }
+            }
+            else
+            {
+                double anglePercent = processedJoystickX > joystick_deadzone?((processedJoystickX-joystick_deadzone)/(100.0-joystick_deadzone)):(processedJoystickX < -joystick_deadzone?((processedJoystickX+joystick_deadzone)/(100.0-joystick_deadzone)):0.0);
+                anglePercent = constrain(anglePercent, -100.0, 100.0);
+                vControl.setTargetSteeringAngle((100.0 - anglePercent) / 2.0); // Map -100% to 100% joystick to 0% to 100% steering
+            }
+        }
+        else if(vControl.getTestMode() == VehicleControl::TestMode::Test_BrakeSteeringActuatorJoystick)
+        {
+            int8_t summand = processedJoystickX > joystick_deadzone?1:(processedJoystickX < -joystick_deadzone?-1:0);
+            steering_angle_target_test += (double) summand / 2.0;
+            steering_angle_target_test = constrain(steering_angle_target_test, -100.0, 100.0);
+            vControl.setTargetSteeringAngle((100.0 - steering_angle_target_test) / 2.0); // Map -100% to 100% joystick to 0% to 100% steering
+
+            if(summand != 0)
+            {
+                LOG_MSG("steering_angle_target_test: " + String(steering_angle_target_test));
+            }
+        }
+        else if(vControl.getTestMode() == VehicleControl::TestMode::Test_InverterJoystick)
+        {
+            if(steeringInputPercent < 0)
+            {
+                torque_request_test = 0.0;
+            }
+            else if(steeringInputPercent > 0)
+            {
+                if(motor_rpm == 0 && last_reverse_toggle_time + 2000 < millis())
+                {
+                    last_reverse_toggle_time = millis();
+                    reverse_bit = 0x01 - reverse_bit; // toggle bit
+
+                    LOG_MSG("Toggling reverse bit to: " + String(reverse_bit));
+                }
+                torque_request_test = 0.0;
+            }
+        }
+    }
+    //else if ADSystem
+    else if(vControl.getOperationMode() == VehicleControl::OperationMode::ADSystemControl)
+    {
+        int16_t ADSystemJoystickXVal = (int16_t)(processedJoystickX * 16384);
+        int16_t ADSystemJoystickYVal = (int16_t)(processedJoystickY * 16384);
+
+        uint16_t ADSystemJoystickXVal_uint16 = *(uint16_t *) &ADSystemJoystickXVal;
+        uint16_t ADSystemJoystickYVal_uint16 = *(uint16_t *) &ADSystemJoystickYVal;
+        
+        uint8_t buf[4] = {};
+        buf[0] = (uint8_t) (ADSystemJoystickXVal >> 8);
+        buf[1] = (uint8_t) (ADSystemJoystickXVal & 0xFF);
+        buf[2] = (uint8_t) (ADSystemJoystickYVal >> 8);
+        buf[3] = (uint8_t) (ADSystemJoystickYVal & 0xFF);
+
+        //adsysHandler.sendMessage(AdsysMsgType::JOYSTICK_POS_PERCENT, buf, 4);
+    }
+}
+
+void control_brake_pedal()
+{
+    // Compute error between target and actual position
+    // float error = brake_pedal_target - (brake_pedal_position / 100);
+
+    // // PID calculations
+    // integral += error; // Accumulate integral term
+    // float derivative = error - previous_error;
+    // previous_error = error;
+
+    // // Compute PID output
+    // float pid_output = (Kp * error) + (Ki * integral) + (Kd * derivative);
+
+    // // Apply the PID output to the servo position
+    // servo_position += pid_output;
+
+    // // Constrain servo position within limits
+    // servo_position = constrain(servo_position, SERVO_MIN_POSITION, SERVO_MAX_POSITION);
+
+    // // Write the servo position
+    // brake_servo.write(servo_position);
+
+    VehicleControl::OperationMode vControlMode = vControl.getOperationMode();
+
+    if(vControlMode == VehicleControl::OperationMode::ECUTestControl)
+    {
+        VehicleControl::TestMode vControlTestMode = vControl.getTestMode();
+
+        if(vControlTestMode == VehicleControl::TestMode::Test_None || vControlTestMode == VehicleControl::TestMode::Test_FullSystem)
+        {
+            vControl.setTargetBrakePosition(brake_pedal_target * 100.0); // Map 0.0 to 1.0 to 0 to 100%
+        }
+        else if(vControlTestMode == VehicleControl::TestMode::Test_BrakeSteeringActuatorJoystick)
+        {
+            int8_t summand = processedJoystickY > torque_zero_space?1:(processedJoystickY < -torque_zero_space?-1:0);
+            brake_pedal_target_test += (double) summand / 2.0; // increase or decrease target by joystick position
+            brake_pedal_target_test = constrain(brake_pedal_target_test, 0.0, 100.0);
+            vControl.setTargetBrakePosition(brake_pedal_target_test); // Map 0 to 1 -> 0 to 100%
+
+            if(summand != 0)
+            {
+                LOG_MSG("brake_pedal_target_test: " + String(brake_pedal_target_test) + "%");
+            }
+        }
+    }
+    else
+    {
+        // don't control brake in ADSystemControl mode
+    }
+}
+
+void control_acceleration()
+{
+    //  Overall control principle
+    //  -5% to 5% joystick -> zero acceleration -> ramp up regen to torque min, when motor rpm is below torque_regen_cutoff_rpm put torque to zero
+    //  > 5% joystick -> acceleration -> ramp up to torque_theoretical which is depending on the joystick position
+
+    VehicleControl::OperationMode vControlMode = vControl.getOperationMode();
+
+    if(vControlMode == VehicleControl::OperationMode::ECUTestControl)
+    {
+        VehicleControl::TestMode vControlTestMode = vControl.getTestMode();
+        if (vControlTestMode == VehicleControl::TestMode::Test_BrakeSteeringActuatorJoystick)
+            return;
+        else if (vControlTestMode == VehicleControl::TestMode::Test_InverterJoystick)
+        {
+            int8_t summand = processedJoystickY > torque_zero_space?5:(processedJoystickY < -torque_zero_space?-5:0);
+            torque_request_test += summand;
+            torque_request_calculated = constrain(torque_request_test, torque_min, torque_max);
+
+            if(summand != 0)
+            {
+                LOG_MSG("torque_request_test: " + String(torque_request_test) + "%");
+            }
+        }
+    }
+    else if(vControlMode == VehicleControl::OperationMode::ADSystemControl)
+    {
+        return; // don't control acceleration in ADSystemControl mode
+    }
+
+    // we need motor speed additional
+    if ((joystick_error_flag == false) && (joystick_control_active == true))
+    {
+        if (processedJoystickY > torque_zero_space) // Acceleration or hold max speed
+        {
+            double vehicle_speed_input = (processedJoystickY - joystick_deadzone) * vehicle_speed_limit;
+
+            if(vehicle_speed_target < vehicle_speed_input - 0.1)
+            {
+                vehicle_speed_target += vehicle_speed_ramp_up; 
+            }
+            else if (vehicle_speed_target > vehicle_speed_input + 0.1)
+            {
+                vehicle_speed_target -= vehicle_speed_ramp_down;
+            }
+            vehicle_speed_target = constrain(vehicle_speed_target, 0.0, vehicle_speed_limit);
+
+            double save_prev_value = torque_request_internal;
+
+            double vdiff_m_per_s = (vehicle_speed_target - vehicle_speed) / 3.6; // km/h to m/s -> factor 1000/3600
+            double mass = 1000;
+            double sign = vdiff_m_per_s/abs(vdiff_m_per_s);
+
+            torque_theoretical = sign * 200.0 * vdiff_m_per_s * vdiff_m_per_s * mass / 100.0 / 5.0; // 100: 10ms steps, 5: torque to reach target in 5 seconds
+
+            // now ramping consideration
+            if (torque_request_internal < torque_theoretical)
+            {
+                torque_request_internal = torque_request_internal + torque_ramp_accel;
+            }
+            else
+            {
+                torque_request_internal = torque_request_internal - torque_ramp_accel;
+            }
+
+            // debug speed limiter
+            // LOG_MSG("v in:" + String(vehicle_speed_input) + " | v target: " + String(vdiff_m_per_s) + " | v target: " + String(vdiff_m_per_s) + " | torque_theoretical: " + String(torque_theoretical) + " | torque req internal: " + String(torque_request_internal));
+
+            // limit speed
+            if(vehicle_speed > vehicle_speed_limit)
+            {
+                torque_request_internal -= torque_ramp_accel;
+            }
+
+            // Clamp torque within safe limits
+            torque_request_internal = constrain(torque_request_internal, torque_min, torque_max);
+        }
+        else // Regen
+        {
+            vehicle_speed_target -= vehicle_speed_ramp_down;
+            vehicle_speed_target = constrain(vehicle_speed_target, 0.0, vehicle_speed_limit);
+
+            torque_theoretical = 0;
+            if (motor_rpm > torque_regen_cutoff_rpm_high) // Normal regen behavior above high threshold
+            {
+                if (torque_request_internal > 0)
+                {
+                    torque_request_internal -= torque_ramp_accel;
+                }
+                else
+                {
+                    torque_request_internal -= torque_ramp_decell;
+                }
+            }
+            else if (motor_rpm < torque_regen_cutoff_rpm_low) // Below low threshold, turn torque off smoothly
+            {
+                torque_request_internal *= 0.9; // Gradual decay instead of instant cutoff
+
+                if (abs(torque_request_internal) < torque_regen_cutoff_rpm_full)
+                {
+                    torque_request_internal = 0.0; // Fully off only when close to zero
+                }
+            }
+            // If within hysteresis band, maintain current torque
+            else
+            {
+                // Do nothing (hold previous torque to prevent oscillation)
+            }
+
+            // Clamp torque within safe limits
+            torque_request_internal = constrain(torque_request_internal, torque_min, torque_max);
+        }
+    }
+    else
+    {
+        torque_request_calculated = 0.0;
+    }
+    // clamp to max values again for extra safety
+    torque_request_calculated = constrain(torque_request_internal, torque_min, torque_max);
+
+    if (processedJoystickY < (torque_zero_space * -1))
+    {
+        // Compute braking force based on joystick input
+        brake_calculated = BRAKE_PARKING + ((1-BRAKE_PARKING) * (-processedJoystickY / (100.0 - torque_zero_space)));
+    }
+    else if (processedJoystickY > torque_zero_space)
+    {
+        brake_calculated = 0;
+    }
+    else
+    {
+        // Check if motor is at zero RPM and hold it for a set time
+        if (motor_rpm == 0)
+        {
+            if (motor_zero_time == 0)
+            {
+                motor_zero_time = millis(); // Start timing
+            }
+            else if ((millis() - motor_zero_time) > (PARK_BRAKE_TIME_THRESHOLD))
+            {
+                brake_calculated = BRAKE_PARKING; // Engage parking brake
+            }
+        }
+        else
+        {
+            motor_zero_time = 0; // Reset timer when RPM is nonzero
+        }
+    }
+
+    // Apply smooth ramping to reach target brake position
+    if (brake_pedal_target < brake_calculated)
+    {
+        brake_pedal_target += BRAKE_RAMP_UP;
+    }
+    else if (brake_pedal_target > brake_calculated)
+    {
+        brake_pedal_target -= BRAKE_RAMP_DOWN;
+    }
+
+    // Ensure brake target remains within valid limits
+    brake_pedal_target = constrain(brake_calculated, 0.0, 1.0);
+
+    //LOG_MSG("Brake Pedal Target: " + String(brake_pedal_target * 100.0) + "%");
+}
+
+// ——————————————————————————————————————————————————————————————————————————————
+//   Print Status (Every 1s)
+// ——————————————————————————————————————————————————————————————————————————————
+
+void printStatus()
+{
+    LOG_MSG("---------------------------------------------------");
+    //LOG_MSG("Joystick X: " + String(processedJoystickX) + " | Joystick Y: " + String(processedJoystickY));
+    //LOG_MSG("Brake Pedal Target: " + String(brake_pedal_target) + "% | Brake Pedal Position: " + String(brake_pedal_position));
+    //LOG_MSG("Torque Request (iMiev): " + String(torque_request) + " | Gear: " + String(gear_selection) + " | Motor RPM: " + String(motor_rpm) + " | Vehicle Speed: " + String(vehicle_speed) + " km/h");
+    //LOG_MSG("Torque Theoretical: " + String(torque_theoretical) + " | Torque Calculated: " + String(torque_request_calculated));
+    LOG_MSG("Vehicle speed: " + String(vehicle_speed) /*+ " | SoC: " + String(SoCValuePercent) + "% | Range: " + String(rangeKm) + " km | RPMs: FL: " + String(RPM_fl) + " | FR: " + String(RPM_fr) + " | RL: " + String(RPM_rl) + " | RR: " + String(RPM_rr)*/ + " | ignitionState: " + String(ignitionState));
+    LOG_MSG("Total bytes received from AD System: " + String(totalBytesReceivedADSystem) + " | AD System connected: " + String(vControl.isAdsystemConnected()) + " | Dropped messages count: " + String(adsysHandler.getDroppedMessagesCount()));
+    LOG_MSG("ECU Reset Reason: " + esp_reset_reason_array[esp_reset_reason()]);
+    LOG_MSG("Steering Angle: " + String(steering_angle) + " | vControl.getOperationMode(): " + String(vControl.getOperationMode()));
+    LOG_MSG("Avg Execution Times (ms): Scheduler: " + String(avgExecTimeMsScheduler, 3) + " | Poll CAN: " + String(avgExecTimeMsPollCAN, 3) + " | RC AD Sys: " + String(avgExecTimeMsRcADSys, 3));
+    LOG_MSG("Max Execution Times in last sec (ms): Scheduler: " + String(maxInASecExecTimeMsScheduler) + " | Poll CAN: " + String(maxInASecExecTimeMsPollCAN) + " | RC AD Sys: " + String(maxInASecExecTimeMsRcADSys));
+    LOG_MSG("Loop executions per second: " + String(loopPeriodsCounter) + " | Loop execution time (ms): " + String((1000.0 / (double)loopPeriodsCounter), 3));
+
+    LOG_MSG("Avg Execution Times (ms): VC Run: " + String(avgExecTimeVCRun, 3) + " | VC Send Status: " + String(avgExecTimeVCSS, 3) + " | VC Dynamics: " + String(avgExecTimeDC, 3) + "| Print Status: " + String(avgExecTimePS, 3));
+    LOG_MSG("Max Execution Times in last sec (ms): VC Run: " + String(maxInASecExecTimeMsVCRun) + " | VC Send Status: " + String(maxInASecExecTimeMsVCSS) + " | VC Dynamics: " + String(maxInASecExecTimeMsDC) + "| Print Status: " + String(maxInASecExecTimeMsPS));
+    LOG_MSG("Motor injections last second: " + String(motorInjPerSeconds));
+
+    motorInjPerSeconds = 0;
+
+    loopPeriodsCounter = 0;
+
+    // not included in esp32-arduino; customly build esp32 lib would be needed
+    /*char runtimeStatsBuffer[512];
+    memset(runtimeStatsBuffer, 0, sizeof(runtimeStatsBuffer));
+    vTaskGetRunTimeStats(runtimeStatsBuffer);
+    LOG_MSG("Task Runtime Stats:\n" + String(runtimeStatsBuffer));*/
+
+    // Reset max counters for next interval
+    maxInASecExecTimeMsScheduler = 0;
+    maxInASecExecTimeMsPollCAN = 0;
+    maxInASecExecTimeMsRcADSys = 0;
+}
+
+int log_printf(const char *fmt, va_list args)
+{
+    return USBSerial1.printf(fmt, args);
+}
+
+/**************************************************************************
+ *  Setup and Loop
+ **************************************************************************/
 void setup()
 {
-    // Setup serial for debbuging.
     Serial.begin(115200);
 
-    // PrintParamsJson();
+    Serial.setTimeout(50);
 
-    //   // Set pins
-    // ESP32Can.setPins(CAN_TX, CAN_RX);
+    // Turn off WiFi completely
+    WiFi.mode(WIFI_OFF);
 
-    //   // You can set custom size for the queues - those are default
-    //   ESP32Can.setRxQueueSize(5);
-    // ESP32Can.setTxQueueSize(5);
+    disableCore0WDT();
+    disableCore1WDT();
+    
+    
+    //esp_log_level_set("*", ESP_LOG_DEBUG);
 
-    //   // .setSpeed() and .begin() functions require to use TwaiSpeed enum,
-    //   // but you can easily convert it from numerical value using .convertSpeed()
-    //   ESP32Can.setSpeed(ESP32Can.convertSpeed(500));
+    //esp_log_level_set("*", ESP_LOG_DEBUG);
+    //esp_log_set_vprintf(&log_printf);
 
-    //   // You can also just use .begin()..
-    //   if(ESP32Can.begin()) {
-    //       Serial.println("CAN bus started!");
-    //   } else {
-    //       Serial.println("CAN bus failed!");
-    //   }
+#if(INIT_USB_SERIAL==1)
+    // Initialize USB CDC for monitoring/debug output.
+    USBSerial1.begin();
+    //USBSerial1.setRxBufferSize(1024);
+    USB.begin();
+#endif
 
-    // or override everything in one command;
-    // It is also safe to use .begin() without .end() as it calls it internally
+    //USBSerial1.setDebugOutput(true);
 
-    WriteParamsJsonToFlash();
-    // PrintParamsJsonfromfile();
-    if (!initializeSPIFFSAndLoadFile())
+    ignitionState = false;
+
+    //delay(10000);
+
+    uint8_t ECUResetReason = 0;
+
+    Serial.println("-------------------------------------");
+    Serial.println("Reset reason: " + String(esp_reset_reason()));
+    Serial.println("-------------------------------------");
+
+    // Initialize Servo
+    // ESP32PWM::allocateTimer(0);
+    // ESP32PWM::allocateTimer(1);
+    // ESP32PWM::allocateTimer(2);
+    // ESP32PWM::allocateTimer(3);
+    // brake_servo.setPeriodHertz(50);           // standard 50 hz servo
+    // brake_servo.attach(servoPin, 1000, 2000); // attaches the servo on pin 18 to the servo object
+
+    // Configure the built-in RGB LED.
+    pinMode(RGB_BUILTIN, OUTPUT);
+    //digitalWrite(RGB_BUILTIN, LOW);
+
+    // Configure the emergency button pin (active low).
+    //pinMode(EMERGENCY_BUTTON_PIN, INPUT_PULLDOWN);
+
+    // Initialize the CAN buses using the CAN manager.
+    canManager_setup();
+
+    vControl.initialize();
+
+    // Set up AD System UART message callback
+    adsysHandler.setMessageCallback([&](const AdsysMessage &msg){ vControl.ADSystemMessagesCb(msg); });
+    vControl.adsysConnectionLostAction(); // set initial connection state
+   
+    // Optionally, print a startup message.
+    LOG_MSG("System Initialized. Starting tasks...");
+
+#if(USE_TASK_SCHEDULER==0)
+    // Define tasks
+    xTaskCreateStatic(xPrintStatus, "xPrintStatusTask", STACK_SIZE_TASK_DEFAULT, NULL, tskIDLE_PRIORITY+10, xStackTaskPrintStatus, &xPrintStatusTaskBuffer);
+    xTaskCreateStatic(xVehicleControlRun, "xVehicleControlRunTask", STACK_SIZE_TASK_DEFAULT, NULL, tskIDLE_PRIORITY+10, xStackTaskVehicleControlRun, &xVehicleControlRunTaskBuffer);
+    xTaskCreateStatic(xVehicleControlSendStatus, "xVehicleControlSendStatusTask", STACK_SIZE_TASK_DEFAULT, NULL, tskIDLE_PRIORITY+10, xStackTaskVehicleControlSendStatus, &xVehicleControlSendStatusTaskBuffer);
+    xTaskCreateStatic(xVehicleDynamics, "xVehicleDynamicsControlTask", STACK_SIZE_TASK_DEFAULT, NULL, tskIDLE_PRIORITY+10, xStackTaskVehicleDynamicsControl, &xVehicleDynamicsControlTaskBuffer);
+#endif
+}
+
+// careful, this was behaving buggy -> individual bytes were not put out
+void AdsysUartHandler::uartSendByte(uint8_t byte)
+{
+    ADSYS_PORT.write(byte);
+}
+
+void AdsysUartHandler::uartSendBytes(std::vector<uint8_t> &bytes)
+{
+    ADSYS_PORT.write(bytes.data(), bytes.size());
+}
+
+
+void sendDebugMessage(const char* msg)
+{
+    USBSERIAL_PRINTLN(msg);
+}
+
+void sendDebugMessage(const String& msg)
+{
+    USBSERIAL_PRINTLN(msg);
+}
+void sendDebugMessage(StringSumHelper& msg)
+{
+    USBSERIAL_PRINTLN(msg);
+}
+
+void receive_from_adsystem()
+{
+    int numBytes = ADSYS_PORT.available();
+    //LOG_MSG("Bytes in Rx buffer: " + String(numBytes));
+
+    if(numBytes <= 0)
     {
-        Serial.println("Failed to initialize SPIFFS or load parameter file.");
-    }
-    else
-    {
-        Serial.println("SPIFFS initialized and params.json loaded successfully.");
+        return;
     }
 
-    Param::SetInt(Param::version, 4); // COM protocol version 4
+    size_t readNumReq = (numBytes > RX_TMP_BUF_SIZE)? RX_TMP_BUF_SIZE : numBytes;
+    size_t readNumAct = ADSYS_PORT.readBytes(rxTmpBuf, readNumReq);
 
-    if (ESP32Can.begin(ESP32Can.convertSpeed(500), CAN_TX, CAN_RX, 10, 10))
-    {
-        Serial.println("CAN bus started!");
-    }
-    else
-    {
-        Serial.println("CAN bus failed!");
-    }
+    //LOG_MSG("Read " + String(readNumAct) + " bytes from AD System UART.");
+    totalBytesReceivedADSystem += readNumAct;
+
+    adsysHandler.onBytesReceived(rxTmpBuf, readNumAct);
 }
 
 void loop()
 {
-    CanFrame rxFrame;
-    static uint32_t lastStamp = 0;
-    uint32_t currentStamp = millis();
+    uint32_t micros_start = micros();
+    //LOG_MSG("EnL");
+#if(USE_TASK_SCHEDULER==1)
+    runner.execute();
+#endif
+    uint32_t micros_after_scheduler = micros();
 
-    if (currentStamp - lastStamp > 1000)
-    { // sends OBD2 request every second
-        lastStamp = currentStamp;
-        // sendObdFrame(5); // For coolant temperature
-        // Serial.printf("Sent");
-    }
+    pollCAN();
 
-    // You can set custom timeout, default is 1000
-    if (ESP32Can.readFrame(rxFrame, 1000))
+    uint32_t micros_after_pollcan = micros();
+
+    receive_from_adsystem();
+
+    uint32_t micros_end = micros();
+
+    // calculate average execution times
+    avgExecTimeMsScheduler = (avgExecTimeMsScheduler * 1000.0 * (avgN -1) + (micros_after_scheduler - micros_start)) / avgN / 1000.0;
+    avgExecTimeMsPollCAN = (avgExecTimeMsPollCAN * 1000.0 * (avgN -1) + (micros_after_pollcan - micros_after_scheduler)) / avgN / 1000.0;
+    avgExecTimeMsRcADSys = (avgExecTimeMsRcADSys * 1000.0 * (avgN -1) + (micros_end - micros_after_pollcan)) / avgN / 1000.0;
+
+    maxInASecExecTimeMsScheduler = max(maxInASecExecTimeMsScheduler * 1000.0, (double) micros_after_scheduler - micros_start) / 1000.0;
+    maxInASecExecTimeMsPollCAN = max(maxInASecExecTimeMsPollCAN * 1000.0, (double) micros_after_pollcan - micros_after_scheduler) / 1000.0;
+    maxInASecExecTimeMsRcADSys = max(maxInASecExecTimeMsRcADSys * 1000.0, (double) micros_end - micros_after_pollcan) / 1000.0;
+
+    loopPeriodsCounter++;
+
+    //vTaskDelay(1);
+    yield();
+    //LOG_MSG("ExL");
+}
+
+void setVehicleSpeedLimit(double speed)
+{
+    if(speed <= vehicle_speed_limit_emergency)
     {
-        // Comment out if too many requests
-        // Serial.printf("Received frame: %03X \r\n", rxFrame.identifier);
-        sdo.HandleRx(&rxFrame);
+        vehicle_speed_limit = speed;
     }
+}
+
+void setVehicleSpeedLimitEmergency(double speed)
+{
+    vehicle_speed_limit_emergency = speed;
+}
+
+void setTargetVehicleSpeed(double speed)
+{
+    if(speed <= vehicle_speed_limit && speed < vehicle_speed_limit_emergency)
+    {
+        vehicle_speed_target = speed;
+    }
+}
+
+double readVehicleSpeedLimit()
+{
+    return vehicle_speed_limit;
+}
+
+double readVehicleSpeedLimitEmergency()
+{
+    return vehicle_speed_limit_emergency;
+}
+
+double readTargetVehicleSpeed()
+{
+    return vehicle_speed_target;
+}
+
+void setPhysicalAccelerationRequest(int16_t ADSystemPhysicalAccerealation)
+{
+    //LOG_MSG("Received physical acceleration request: " + String(ADSystemPhysicalAccerealation) + "; Value would have been set but for testing it is hard coded to zero.");
+    //ADSystemPhysicalAccerealation = 0;
+    ADSystemPhysicalAccelerationRequest = constrain(ADSystemPhysicalAccerealation, torque_min, torque_max);;
+}
+
+bool getIgnitionState()
+{
+    return ignitionState;
+}
+
+bool getVehicleMoving()
+{
+    return (vehicle_speed>1.0)?true:false;
 }
